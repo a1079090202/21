@@ -1,0 +1,24 @@
+{
+  "name": "expiry-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "域名/证书到期监控服务（内网单机，纯后端 + CLI）",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/src/scheduler.js",
+    "seed": "node dist/src/seed.js",
+    "cli": "node dist/src/cli.js",
+    "test": "tsc && node --test dist/test/*.test.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.0",
+    "@types/node-cron": "^3.0.11",
+    "typescript": "^5.8.3"
+  }
+}
