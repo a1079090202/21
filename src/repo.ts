@@ -169,11 +169,30 @@ export function getItem(db: DB, id: number): MonitorItem | undefined {
     | undefined;
 }
 
-export function updateExpiresOn(db: DB, id: number, expiresOn: string): boolean {
-  const r = db
-    .prepare('UPDATE monitor_items SET expires_on = ? WHERE id = ?')
-    .run(expiresOn, id);
-  return r.changes > 0;
+/**
+ * 续期：更新到期日，同时把该项未确认（open）的告警自动确认，结束当前告警周期。
+ * 告警去重只看 open 状态、不分周期——续期不关掉旧告警的话，上一周期的 open 告警
+ * 会把新一轮到期的同档位告警永久判为 duplicate 拦截。两条 UPDATE 同事务，要么都生效要么都回滚。
+ */
+export function renewItem(
+  db: DB,
+  id: number,
+  expiresOn: string,
+  handledAt: number,
+): { renewed: boolean; closedAlerts: number } {
+  const tx = db.transaction(() => {
+    const r = db.prepare('UPDATE monitor_items SET expires_on = ? WHERE id = ?').run(expiresOn, id);
+    if (r.changes === 0) return { renewed: false, closedAlerts: 0 };
+    const a = db
+      .prepare(
+        `UPDATE alerts
+         SET status = 'acknowledged', handler = ?, handle_note = ?, handled_at = ?
+         WHERE item_id = ? AND status = 'open'`,
+      )
+      .run('（续期）', `续期至 ${expiresOn}，上一告警周期自动确认`, handledAt, id);
+    return { renewed: true, closedAlerts: a.changes };
+  });
+  return tx();
 }
 
 // ---------- 检查历史（只追加） ----------
@@ -223,6 +242,15 @@ export function listCheckRuns(db: DB, limit = 20): CheckRun[] {
   return db
     .prepare('SELECT * FROM check_runs ORDER BY id DESC LIMIT ?')
     .all(limit) as CheckRun[];
+}
+
+/**
+ * 指定上海日期是否已有成功的检查记录。
+ * runCheck 是单事务：失败整体回滚、零写入，所以"有行"就等价于"当天成功跑过"。
+ * 只判存在性、不数行数：守护进程与手动 check run 同一天可能合法地落多条。
+ */
+export function hasCheckRunOnDate(db: DB, date: string): boolean {
+  return db.prepare('SELECT 1 FROM check_runs WHERE run_date = ? LIMIT 1').get(date) !== undefined;
 }
 
 export function listCheckResults(db: DB, runId: number): CheckResult[] {

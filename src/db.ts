@@ -109,6 +109,14 @@ function migrate(db: Database.Database): void {
   };
   addColumn('monitor_items', 'ADD COLUMN group_name TEXT', 'group_name');
   addColumn('check_results', 'ADD COLUMN silence_kind TEXT', 'silence_kind');
+  // 历史回填：旧库的 check_results 没有 silence_kind 列，补列后存量行该列为 NULL，
+  // 而 check history 的静默列只看 silence_kind，会把 silenced=1 的历史记录显示成"未静默"。
+  // 旧版尚无分组功能，历史静默只可能是单项静默，一律回填 'item'。
+  // 不限制"列是本次新加"：被旧版迁移补过列、已留下 NULL 的库再次打开时也能修复。
+  // 新写入的记录 silenced=1 时 silence_kind 必非 NULL，此 UPDATE 对它们无影响。
+  if (tableExists('check_results')) {
+    db.exec(`UPDATE check_results SET silence_kind = 'item' WHERE silenced = 1 AND silence_kind IS NULL`);
+  }
 }
 
 export type DB = Database.Database;
@@ -119,6 +127,9 @@ export function openDb(path: string = DEFAULT_DB_PATH): DB {
   }
   const db = new Database(path);
   db.pragma('foreign_keys = ON');
+  // 未开 WAL：守护进程写事务撞上 CLI 写操作时，等 5 秒而不是立刻抛 SQLITE_BUSY
+  // （CLI 写入都是毫秒级）。只化解同机撞车，不承诺跨进程互斥。
+  db.pragma('busy_timeout = 5000');
   migrate(db);
   db.exec(SCHEMA);
   return db;

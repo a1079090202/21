@@ -7,7 +7,7 @@
  *   item add      --kind cert   --name <名称> --issued-to <签发对象> --expires <YYYY-MM-DD> [--group <组>] [--note ...]
  *   item list     [--group <组> | --ungrouped]         监控项列表，可按组筛选
  *   item group    <id> (--name <组> | --clear)         把监控项移入/移出分组
- *   item renew    <id> --expires <YYYY-MM-DD>          续期后更新到期日
+ *   item renew    <id> --expires <YYYY-MM-DD>          续期后更新到期日（同时自动确认该项未处理告警，结束上一告警周期）
  *   check run                                          手动触发一次检查
  *   check history [--run <id>]                         查看检查历史/某次详情
  *   alert list    [--level 30|14|7] [--status open|acknowledged] [--group <组>]
@@ -40,8 +40,8 @@ import {
   listItems,
   listSilenceWindows,
   isValidGroupName,
+  renewItem,
   setItemGroup,
-  updateExpiresOn,
   type AlertStatus,
   type ItemKind,
   type ReportAlertStatus,
@@ -58,24 +58,97 @@ import { writeFileSync } from 'node:fs';
 
 class UsageError extends Error {}
 
-function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string> } {
+interface ArgSpec {
+  /** 允许且必须带值的 flag，如 --name */
+  valueFlags?: readonly string[];
+  /** 允许且不带值的开关 flag，如 --ungrouped、--clear */
+  boolFlags?: readonly string[];
+  /** 互斥组：同组内的 flag 至多出现一个 */
+  conflicts?: ReadonlyArray<readonly string[]>;
+  /** 精确的位置参数个数；undefined 表示不校验 */
+  positional?: number;
+  /** 位置参数叫法，用于报错文案 */
+  positionalName?: string;
+}
+
+interface ParsedArgs {
+  positional: string[];
+  flags: Record<string, string>;
+}
+
+/**
+ * 按命令声明的规格严格解析参数。下列情况一律抛 UsageError：
+ * 未知 flag、值参数尾部缺值（或后面跟了另一个 flag）、开关参数被赋值、
+ * 同一 flag 重复出现、互斥参数同传、位置参数多了或少了。
+ * 必须在打开数据库和执行业务之前调用——错误输入不得产生任何副作用。
+ * 同时支持 `--key value` 和 `--key=value` 两种写法。
+ */
+function parseCommandArgs(argv: string[], spec: ArgSpec): ParsedArgs {
+  const valueFlags = new Set(spec.valueFlags ?? []);
+  const boolFlags = new Set(spec.boolFlags ?? []);
   const positional: string[] = [];
   const flags: Record<string, string> = {};
+  let onlyPositional = false;
+
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a.startsWith('--')) {
-      const key = a.slice(2);
-      const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('--')) {
+    if (onlyPositional || !a.startsWith('--') || a === '--') {
+      if (a === '--' && !onlyPositional) {
+        onlyPositional = true; // 标准约定：-- 之后一律按位置参数
+      } else {
+        positional.push(a);
+      }
+      continue;
+    }
+    let key: string;
+    let inlineValue: string | undefined;
+    const eq = a.indexOf('=');
+    if (eq >= 0) {
+      key = a.slice(2, eq);
+      inlineValue = a.slice(eq + 1);
+    } else {
+      key = a.slice(2);
+    }
+    if (key === '' || key.startsWith('-')) throw new UsageError(`无法识别的参数：${a}`);
+    if (flags[key] !== undefined) throw new UsageError(`参数 --${key} 重复出现，请只写一次`);
+
+    if (boolFlags.has(key)) {
+      if (inlineValue !== undefined) throw new UsageError(`--${key} 是开关参数，不接受值：${a}`);
+      flags[key] = 'true';
+    } else if (valueFlags.has(key)) {
+      if (inlineValue !== undefined) {
+        if (inlineValue === '') throw new UsageError(`参数 --${key} 缺少值`);
+        flags[key] = inlineValue;
+      } else {
+        const next = argv[i + 1];
+        if (next === undefined || next.startsWith('--')) {
+          throw new UsageError(`参数 --${key} 缺少值`);
+        }
         flags[key] = next;
         i++;
-      } else {
-        flags[key] = 'true';
       }
     } else {
-      positional.push(a);
+      throw new UsageError(`未知参数 --${key}（该命令不支持此参数）`);
     }
   }
+
+  for (const group of spec.conflicts ?? []) {
+    const present = group.filter((k) => flags[k] !== undefined);
+    if (present.length > 1) {
+      throw new UsageError(`参数 ${present.map((k) => `--${k}`).join(' 和 ')} 不能同时使用`);
+    }
+  }
+
+  if (spec.positional !== undefined && positional.length !== spec.positional) {
+    const what = spec.positionalName ? ` ${spec.positionalName}` : '';
+    if (positional.length < spec.positional) {
+      throw new UsageError(`缺少位置参数${what}：需要 ${spec.positional} 个，收到 ${positional.length} 个`);
+    }
+    throw new UsageError(
+      `多余的位置参数：${positional.slice(spec.positional).join(' ')}（该命令只接受 ${spec.positional} 个位置参数${what}）`,
+    );
+  }
+
   return { positional, flags };
 }
 
@@ -94,9 +167,26 @@ function requireDate(flags: Record<string, string>, key: string): string {
 }
 
 function requireId(value: string | undefined, what: string): number {
+  if (value === undefined || !/^\d+$/.test(value)) {
+    throw new UsageError(`${what} 必须是正整数，收到：${value ?? '空'}`);
+  }
   const n = Number(value);
-  if (!value || !Number.isInteger(n) || n <= 0) throw new UsageError(`${what} 必须是正整数，收到：${value ?? '空'}`);
+  if (!Number.isSafeInteger(n) || n <= 0) {
+    throw new UsageError(`${what} 必须是正整数，收到：${value}`);
+  }
   return n;
+}
+
+/** --hours 严格解析：只接受十进制数字（拒绝 0x10、1e2、12h 等 Number() 能吞下的写法），范围 (0, 24] */
+function parseHours(raw: string): number {
+  if (!/^(?:\d+|\d*\.\d+)$/.test(raw)) {
+    throw new UsageError(`--hours 必须是 (0, 24] 之间的数字，收到：${raw}`);
+  }
+  const hours = Number(raw);
+  if (!(hours > 0 && hours <= 24)) {
+    throw new UsageError('--hours 必须在 (0, 24] 之间，静默窗口最长 24 小时');
+  }
+  return hours;
 }
 
 function pad(s: string, w: number): string {
@@ -109,18 +199,24 @@ function tierLabel(tier: Tier | null): string {
   return tier === null ? '-' : `${tier}天档`;
 }
 
-/** RFC 4180：含逗号/引号/换行的字段用双引号包裹，引号双写 */
+/**
+ * RFC 4180 转义 + CSV 公式注入防御：
+ * 表格软件（Excel/WPS/Numbers）会把以 = + - @ 或制表符开头的单元格当公式执行，
+ * 可被 HYPERLINK/DDE 等利用；双引号包裹拦不住（解析后内容仍以 = 开头），
+ * 必须前置单引号强制按文本解析，再做 RFC 4180 的引号包裹与双写。
+ */
 function csvCell(s: string): string {
-  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  const safe = /^[=+@\t\r-]/.test(s) ? `'${s}` : s;
+  return /[",\r\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 }
 
 const KIND_LABEL: Record<ItemKind, string> = { domain: '域名', cert: '证书' };
 
 const GROUP_COL = 14;
 
-/** 校验分组标签格式；要求存在时再校验存在性（allowUngrouped: 传空表示未分组） */
+/** 校验分组标签格式；要求存在时再校验存在性 */
 function resolveGroupName(db: ReturnType<typeof openDb>, raw: string | undefined): string {
-  if (raw === undefined || raw === 'true' || raw === '') throw new UsageError('缺少参数 --group');
+  if (raw === undefined) throw new UsageError('缺少参数 --group');
   if (!isValidGroupName(raw)) {
     throw new UsageError(`组名只能用小写字母、数字、中划线、下划线（1~32 字符），收到：${raw}`);
   }
@@ -132,9 +228,77 @@ function tierStatusLabel(s: ReportAlertStatus): string {
   return s === 'open' ? '未处理' : s === 'acknowledged' ? '已确认' : '未告警';
 }
 
+/**
+ * 各命令的参数规格；未列入此表的命令一律视为未知命令（只打印用法、退出码 1，不打开数据库）。
+ * valueFlags 必须带值，boolFlags 必须不带值，conflicts 为互斥组，positional 为精确位置参数个数。
+ */
+const COMMAND_SPECS: Record<string, ArgSpec> = {
+  'group add': { valueFlags: ['description'], positional: 1, positionalName: '<name>' },
+  'group list': { positional: 0 },
+  'item add': {
+    valueFlags: ['kind', 'name', 'registrar', 'issued-to', 'expires', 'group', 'note'],
+    positional: 0,
+  },
+  'item list': {
+    valueFlags: ['group'],
+    boolFlags: ['ungrouped'],
+    conflicts: [['group', 'ungrouped']],
+    positional: 0,
+  },
+  'item group': {
+    valueFlags: ['name'],
+    boolFlags: ['clear'],
+    conflicts: [['name', 'clear']],
+    positional: 1,
+    positionalName: '<id>',
+  },
+  'item renew': { valueFlags: ['expires'], positional: 1, positionalName: '<id>' },
+  'check run': { positional: 0 },
+  'check history': { valueFlags: ['run'], positional: 0 },
+  'alert list': { valueFlags: ['level', 'status', 'group'], positional: 0 },
+  'alert ack': { valueFlags: ['handler', 'note'], positional: 1, positionalName: '<id>' },
+  'silence add': {
+    valueFlags: ['item', 'group', 'hours', 'reason'],
+    conflicts: [['item', 'group']],
+    positional: 0,
+  },
+  'silence list': {
+    valueFlags: ['item', 'group'],
+    conflicts: [['item', 'group']],
+    positional: 0,
+  },
+  report: { valueFlags: ['group'], positional: 0 },
+  'report csv': { valueFlags: ['group', 'out'], positional: 0 },
+};
+
+function printUsage(): void {
+  console.log(
+    [
+      '用法：node dist/src/cli.js <命令>',
+      '',
+      '  group add <name> [--description ...]',
+      '  group list',
+      '  item add --kind domain --name <域名> --registrar <注册商> --expires <YYYY-MM-DD> [--group <组>] [--note ...]',
+      '  item add --kind cert --name <名称> --issued-to <签发对象> --expires <YYYY-MM-DD> [--group <组>] [--note ...]',
+      '  item list [--group <组> | --ungrouped]',
+      '  item group <id> (--name <组> | --clear)',
+      '  item renew <id> --expires <YYYY-MM-DD>   续期：更新到期日并自动确认该项未处理告警（结束上一告警周期）',
+      '  check run',
+      '  check history [--run <id>]',
+      '  alert list [--level 30|14|7] [--status open|acknowledged] [--group <组>]',
+      '  alert ack <id> --handler <处理人> --note <备注>',
+      '  silence add --item <id> --hours <1..24> [--reason ...]',
+      '  silence add --group <组> [--hours <1..24>，默认24] [--reason ...]   整组一键静默，期间新入组项同样生效，到点自动恢复',
+      '  silence list [--item <id> | --group <组>]',
+      '  report [--group <组>]',
+      '  report csv --group <组> [--out <文件>]   三档到期项：域名,到期日,档位,处理状态（不传 --out 输出到标准输出）',
+    ].join('\n'),
+  );
+}
+
 function main(): void {
   const argv = process.argv.slice(2);
-  let cmd: string | undefined = argv[0];
+  const cmd: string | undefined = argv[0];
   let sub: string | undefined = argv[1];
   let rest = argv.slice(2);
   // 允许一级命令直接带 flag（如 report --group finance）：第二段若是 flag 则归位
@@ -142,15 +306,37 @@ function main(): void {
     rest = [sub, ...rest];
     sub = undefined;
   }
-  const { positional, flags } = parseArgs(rest);
+  const command = `${cmd ?? ''} ${sub ?? ''}`.trim();
+  const spec = COMMAND_SPECS[command];
+
+  // 未知命令 / 无参数：只打印用法，不打开数据库、不产生任何副作用
+  if (!spec) {
+    printUsage();
+    if (cmd) process.exitCode = 1;
+    return;
+  }
+
+  // 参数严格解析先于一切业务逻辑：解析失败直接退出码 2，保证错误输入绝不会被执行
+  let parsed: ParsedArgs;
+  try {
+    parsed = parseCommandArgs(rest, spec);
+  } catch (err) {
+    if (err instanceof UsageError) {
+      console.error(`参数错误：${err.message}`);
+      process.exitCode = 2;
+      return;
+    }
+    throw err;
+  }
+  const { positional, flags } = parsed;
+
   const db = openDb();
   const now = Date.now();
 
   try {
-    switch (`${cmd ?? ''} ${sub ?? ''}`.trim()) {
+    switch (command) {
       case 'group add': {
         const name = positional[0];
-        if (name === undefined) throw new UsageError('缺少组名：group add <name>');
         if (!isValidGroupName(name)) {
           throw new UsageError('组名只能用小写字母、数字、中划线、下划线（1~32 字符）');
         }
@@ -239,6 +425,10 @@ function main(): void {
         const id = requireId(positional[0], '监控项 ID');
         const item = getItem(db, id);
         if (!item) throw new UsageError(`监控项 #${id} 不存在`);
+        // 规格已排除 --name/--clear 同传；这里只兜底"两个都没给"
+        if (flags['clear'] === undefined && flags['name'] === undefined) {
+          throw new UsageError('必须指定 --name <组> 或 --clear 之一');
+        }
         if (flags['clear'] !== undefined) {
           setItemGroup(db, id, null);
           console.log(`监控项 #${id}（${item.name}）已移出分组（原分组 ${item.group_name ?? '-'}）`);
@@ -253,8 +443,14 @@ function main(): void {
       case 'item renew': {
         const id = requireId(positional[0], '监控项 ID');
         const expiresOn = requireDate(flags, 'expires');
-        if (!updateExpiresOn(db, id, expiresOn)) throw new UsageError(`监控项 #${id} 不存在`);
-        console.log(`监控项 #${id} 到期日已更新为 ${expiresOn}`);
+        // 续期即结束当前告警周期：同事务更新到期日 + 自动确认该项未处理告警，
+        // 否则上一周期的 open 告警会把新一轮同档位告警永久拦截
+        const { renewed, closedAlerts } = renewItem(db, id, expiresOn, now);
+        if (!renewed) throw new UsageError(`监控项 #${id} 不存在`);
+        console.log(
+          `监控项 #${id} 到期日已更新为 ${expiresOn}` +
+            (closedAlerts > 0 ? `，已自动确认 ${closedAlerts} 条上一周期告警` : ''),
+        );
         break;
       }
 
@@ -312,7 +508,7 @@ function main(): void {
       case 'alert list': {
         const filter: { tier?: Tier; status?: AlertStatus; groupName?: string | null } = {};
         if (flags['level'] !== undefined) {
-          const t = Number(flags['level']);
+          const t = requireId(flags['level'], '--level');
           if (!(TIERS as readonly number[]).includes(t)) throw new UsageError('--level 只能是 30、14 或 7');
           filter.tier = t as Tier;
         }
@@ -363,13 +559,13 @@ function main(): void {
           throw new UsageError('silence add 必须且只能指定一个目标：--item <id> 或 --group <组>');
         }
         // 组静默默认一键 24 小时；单项静默沿用旧用法，仍需显式 --hours
-        const hoursRaw = flags['hours'];
-        const hours = hoursRaw !== undefined ? Number(hoursRaw) : targetGroup ? 24 : NaN;
-        if (flags['hours'] === undefined && targetItem) {
+        let hours: number;
+        if (flags['hours'] !== undefined) {
+          hours = parseHours(flags['hours']);
+        } else if (targetGroup) {
+          hours = 24;
+        } else {
           throw new UsageError('缺少参数 --hours（单项静默需显式指定 1~24 小时）');
-        }
-        if (!Number.isFinite(hours) || hours <= 0 || hours > 24) {
-          throw new UsageError('--hours 必须在 (0, 24] 之间，静默窗口最长 24 小时');
         }
         const endsAt = now + Math.round(hours * 3600 * 1000);
         const reason = flags['reason'] ?? null;
@@ -408,9 +604,6 @@ function main(): void {
       }
 
       case 'silence list': {
-        if (flags['item'] !== undefined && flags['group'] !== undefined) {
-          throw new UsageError('silence list 的 --item 和 --group 不能同时使用');
-        }
         console.log(pad('ID', 5) + pad('对象', 18) + pad('开始', 22) + pad('结束', 22) + pad('状态', 8) + '原因');
         let empty = true;
 
@@ -517,7 +710,7 @@ function main(): void {
         // UTF-8 BOM 让 Excel 直接双击打开不乱码；CRLF 为 RFC 4180 行分隔
         const csv = '\uFEFF' + lines + '\r\n';
         const out = flags['out'];
-        if (out !== undefined && out !== 'true') {
+        if (out !== undefined) {
           writeFileSync(out, csv, 'utf8');
           console.log(`已导出分组 ${groupName} 的到期报表：${rows.length} 行 → ${out}`);
         } else {
@@ -525,31 +718,6 @@ function main(): void {
         }
         break;
       }
-
-      default:
-        console.log(
-          [
-            '用法：node dist/src/cli.js <命令>',
-            '',
-            '  group add <name> [--description ...]',
-            '  group list',
-            '  item add --kind domain --name <域名> --registrar <注册商> --expires <YYYY-MM-DD> [--group <组>] [--note ...]',
-            '  item add --kind cert --name <名称> --issued-to <签发对象> --expires <YYYY-MM-DD> [--group <组>] [--note ...]',
-            '  item list [--group <组> | --ungrouped]',
-            '  item group <id> (--name <组> | --clear)',
-            '  item renew <id> --expires <YYYY-MM-DD>',
-            '  check run',
-            '  check history [--run <id>]',
-            '  alert list [--level 30|14|7] [--status open|acknowledged] [--group <组>]',
-            '  alert ack <id> --handler <处理人> --note <备注>',
-            '  silence add --item <id> --hours <1..24> [--reason ...]',
-            '  silence add --group <组> [--hours <1..24>，默认24] [--reason ...]   整组一键静默，期间新入组项同样生效，到点自动恢复',
-            '  silence list [--item <id> | --group <组>]',
-            '  report [--group <组>]',
-            '  report csv --group <组> [--out <文件>]   三档到期项：域名,到期日,档位,处理状态（不传 --out 输出到标准输出）',
-          ].join('\n'),
-        );
-        if (cmd) process.exitCode = 1;
     }
   } catch (err) {
     if (err instanceof UsageError) {

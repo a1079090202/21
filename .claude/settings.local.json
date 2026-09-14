@@ -14,7 +14,9 @@
       "Bash(MONITOR_DB=/tmp/accept/old.db node -e ' *)",
       "Bash(export MONITOR_DB=/tmp/accept/e2e.db)",
       "Bash(MONITOR_DB=/tmp/accept/seed.db node dist/src/seed.js)",
-      "Bash(MONITOR_DB=/tmp/accept/seed.db node dist/src/cli.js item list)"
+      "Bash(MONITOR_DB=/tmp/accept/seed.db node dist/src/cli.js item list)",
+      "Bash(git -C /workspace log --oneline -5)",
+      "Bash(npx tsc *)"
     ]
   }
 }
