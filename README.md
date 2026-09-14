@@ -5,12 +5,18 @@
 ## 功能
 
 - **监控项录入**：域名记注册商和到期日；证书记签发对象和有效期止
+- **分组标签**：监控项可打分组（如 `finance`、`web`），列表/告警/报表都能按组筛选；存量项可随时改派分组或移出
 - **每日检查**：每天早上 08:00（Asia/Shanghai）自动跑一轮，也可手动触发
 - **三档告警**：距到期 ≤30 天、≤14 天、≤7 天各记一条告警；同一监控项同一档位的告警未确认前不重复记录（确认后再次命中会重新记）
-- **告警处理**：告警列表按级别/状态筛选；处理后登记处理人和备注
-- **静默窗口**：休假时给单个监控项设静默窗口（最长 24 小时），静默期照常检查、照常留检查记录，只是不新增告警
+- **告警处理**：告警列表按级别/状态/分组筛选；处理后登记处理人和备注
+- **静默窗口**：
+  - 单项静默：给单个监控项设静默窗口（最长 24 小时）
+  - **整组静默**：一条命令给整个分组设 24 小时静默，组内所有项罩住，**静默期间新入组的项同样生效**，到点自动恢复
+  - 静默期照常检查、照常留检查记录（标记静默来源：单项/组），只是不新增告警
 - **只追加的检查历史**：每次检查记 1 条 `check_runs` + 每项 1 条 `check_results`，只 INSERT 不修改，哪天跑了、跑出什么都能回查
-- **CLI 报表**：一条命令列出未来 30 天内到期项和未处理告警
+- **CLI 报表**：一条命令列出未来 30 天内到期项和未处理告警；三档到期项可按组导出 CSV（域名、到期日、档位、处理状态）
+
+> 老版本数据库直接启动即可：首次打开会自动给旧表补 `group_name`、`silence_kind` 列，原有数据和检查记录不受影响。
 
 ## 技术栈
 
@@ -32,28 +38,58 @@ npm start            # 启动守护进程：每天 08:00 (Asia/Shanghai) 自动�
 所有命令形如 `node dist/src/cli.js <命令>`（也可用 `npm run cli -- <命令>`）。
 
 ```bash
-# 录入监控项
+# 分组（组名：小写字母/数字/-/_，1~32 字符）
+node dist/src/cli.js group add finance --description 财务系统
+node dist/src/cli.js group list
+
+# 录入监控项（可直接打组）
 node dist/src/cli.js item add --kind domain --name example.cn --registrar 阿里云 --expires 2026-10-13
-node dist/src/cli.js item add --kind cert --name api-tls --issued-to api.example.cn --expires 2026-11-01
-node dist/src/cli.js item list
+node dist/src/cli.js item add --kind cert --name api-tls --issued-to api.example.cn --expires 2026-11-01 --group finance
+node dist/src/cli.js item list                       # 全部
+node dist/src/cli.js item list --group finance       # 只看财务组
+node dist/src/cli.js item list --ungrouped           # 只看未分组
+node dist/src/cli.js item group 3 --name finance     # 存量项移入 finance 组
+node dist/src/cli.js item group 3 --clear            # 移出分组
 node dist/src/cli.js item renew 3 --expires 2027-09-13   # 续期后更新到期日
 
 # 检查
 node dist/src/cli.js check run                 # 手动触发一次检查
 node dist/src/cli.js check history             # 历次检查概览
-node dist/src/cli.js check history --run 2     # 某次检查的逐项结果
+node dist/src/cli.js check history --run 2     # 某次检查的逐项结果（静默列：组/单项/否）
 
 # 告警
 node dist/src/cli.js alert list                            # 全部告警
 node dist/src/cli.js alert list --level 7 --status open    # 按级别+状态筛
+node dist/src/cli.js alert list --group finance            # 只看财务组
 node dist/src/cli.js alert ack 2 --handler 张三 --note 已续费
 
 # 静默窗口（最长 24 小时）
-node dist/src/cli.js silence add --item 6 --hours 8 --reason 休假
-node dist/src/cli.js silence list
+node dist/src/cli.js silence add --item 6 --hours 8 --reason 休假      # 单项静默
+node dist/src/cli.js silence add --group finance --reason 财务集体休假  # 整组静默 24h（--hours 可省略，默认 24）
+node dist/src/cli.js silence list                                     # 单项+分组窗口统一列出
+node dist/src/cli.js silence list --group finance
 
-# 报表：未来 30 天到期项 + 未处理告警
+# 报表：未来 30 天到期项 + 未处理告警（可加 --group）
 node dist/src/cli.js report
+node dist/src/cli.js report --group finance
+
+# 按组导出三档到期项 CSV：域名,到期日,档位,处理状态（UTF-8 BOM，Excel 直接打开）
+node dist/src/cli.js report csv --group finance --out finance-expiry.csv
+node dist/src/cli.js report csv --group finance          # 不传 --out 输出到标准输出
+```
+
+### 组静默验收流程
+
+```bash
+node dist/src/cli.js group add finance
+node dist/src/cli.js item add --kind domain --name pay.example.cn --registrar 阿里云 --expires <5天后> --group finance
+# …再录 4 条 finance 项…
+node dist/src/cli.js silence add --group finance --reason 财务集体休假   # 到点自动恢复
+node dist/src/cli.js check run        # finance 五项标记"组静默中"，新增告警=0；其他组正常告警
+# 静默期内新录入/新入组的 finance 项，下一次 check run 同样不冒告警
+node dist/src/cli.js check history --run <runId>   # 静默列=组，检查记录照常留
+# 24 小时后（或把检查时刻拨到 ends_at 之后）再 check run：五项自动恢复告警
+node dist/src/cli.js report csv --group finance --out finance.csv  # 5 行，含档位与处理状态
 ```
 
 ## 验收流程（对应需求约定）
@@ -72,7 +108,7 @@ node dist/src/cli.js check history --run <runId>   # 检查结果仍在，silenc
 
 - **分档**：剩余天数 ≤7 → 7 天档；≤14 → 14 天档；≤30 → 30 天档；>30 不告警。一个项某一时刻只属最紧的一档（剩 5 天只记 7 天档）。已过期（剩余为负）按 7 天档持续告警。
 - **去重**：同一监控项、同一档位，已存在"未处理"告警时不再重复记录；确认（ack）后再次命中该档会重新记一条，保证续期拖延能被再次提醒。
-- **静默**：窗口最长 24 小时（数据库 CHECK 约束 + 代码双重校验），只作用于指定监控项；静默期检查照常跑、检查记录照常写（标记 silenced=1），只是不产生新告警。
+- **静默**：窗口最长 24 小时（数据库 CHECK 约束 + 代码双重校验）。单项窗口只作用于指定监控项；组窗口作用于该组——检查时按监控项当前的 `group_name` 实时判定，因此**窗口期间新入组的项同样被罩住、退组即脱离**。静默期检查照常跑、检查记录照常写（标记 silenced=1 及来源 `item`/`group`），只是不产生新告警。窗口结束无需任何操作，下一次检查自然恢复告警。
 - **日期**："哪一天"一律按 Asia/Shanghai 判定（调度、分档、告警日期、报表口径都是），与主机系统时区无关。
 
 ## 备份与恢复
@@ -90,10 +126,10 @@ cp data/monitor.db /backup/monitor-$(date +%F).db
 ## 测试
 
 ```bash
-npm test    # 编译并运行 node:test 测试（18 个用例）
+npm test    # 编译并运行 node:test 测试（26 个用例）
 ```
 
-覆盖：到期分档边界（30/14/7 及档外、已过期）、重复告警拦截（未确认不重复、确认后重新记、档位升级各记一条）、静默窗口（24 小时上限、静默期不新增但留检查记录、只作用于指定项）、跨月/跨年/闰年边界与上海时区日期判定。
+覆盖：到期分档边界（30/14/7 及档外、已过期）、重复告警拦截（未确认不重复、确认后重新记、档位升级各记一条）、静默窗口（单项与整组两种：24 小时上限、静默期不新增但留检查记录、只作用于对应对象、**组静默罩住期间新入组项、到点自动恢复**、单项与组窗口叠加时来源标记）、分组筛选与改派、按组到期报表（档位归并 + 未处理/已确认/未告警状态）、跨月/跨年/闰年边界与上海时区日期判定。
 
 ## 目录结构
 

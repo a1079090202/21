@@ -12,12 +12,14 @@ import { decideAlert } from './alerts.js';
 import type { Tier } from './expiry.js';
 import { daysBetween, shanghaiDate } from './time.js';
 import {
+  activeGroupSilenceForItem,
   activeSilenceWindow,
   insertAlert,
   insertCheckResult,
   insertCheckRun,
   listItems,
   openAlertTiers,
+  type SilenceKind,
 } from './repo.js';
 
 export interface ItemCheckOutcome {
@@ -28,6 +30,7 @@ export interface ItemCheckOutcome {
   daysLeft: number;
   tier: Tier | null;
   silenced: boolean;
+  silenceKind: SilenceKind | null;
   alertCreated: boolean;
   reason: string;
 }
@@ -48,10 +51,18 @@ export function runCheck(db: DB, nowMs: number): RunSummary {
     // 先算完所有判定，再统一落库，保证 check_runs 一次插入即为终态
     const planned = items.map((item) => {
       const daysLeft = daysBetween(today, item.expires_on);
-      const silenced = activeSilenceWindow(db, item.id, nowMs) !== undefined;
+      // 静默来源：单项窗口优先；否则看所属分组当前是否有生效中的组静默窗口。
+      // 组静默按 group_name 实时判定——窗口期间新入组的项同样被罩住。
+      let silenceKind: SilenceKind | null = null;
+      if (activeSilenceWindow(db, item.id, nowMs) !== undefined) {
+        silenceKind = 'item';
+      } else if (activeGroupSilenceForItem(db, item, nowMs) !== undefined) {
+        silenceKind = 'group';
+      }
+      const silenced = silenceKind !== null;
       const openTiers = openAlertTiers(db, item.id);
       const decision = decideAlert(daysLeft, openTiers, silenced);
-      return { item, daysLeft, silenced, decision };
+      return { item, daysLeft, silenceKind, decision };
     });
 
     const alertsCreated = planned.filter((p) => p.decision.shouldCreate).length;
@@ -63,14 +74,15 @@ export function runCheck(db: DB, nowMs: number): RunSummary {
     });
 
     const outcomes: ItemCheckOutcome[] = [];
-    for (const { item, daysLeft, silenced, decision } of planned) {
+    for (const { item, daysLeft, silenceKind, decision } of planned) {
       insertCheckResult(db, {
         runId,
         itemId: item.id,
         checkDate: today,
         daysLeft,
         tier: decision.tier,
-        silenced,
+        silenced: silenceKind !== null,
+        silenceKind,
         alertCreated: decision.shouldCreate,
       });
       if (decision.shouldCreate && decision.tier !== null) {
@@ -88,7 +100,8 @@ export function runCheck(db: DB, nowMs: number): RunSummary {
         expiresOn: item.expires_on,
         daysLeft,
         tier: decision.tier,
-        silenced,
+        silenced: silenceKind !== null,
+        silenceKind,
         alertCreated: decision.shouldCreate,
         reason: decision.reason,
       });

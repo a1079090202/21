@@ -5,7 +5,16 @@
       "Bash(npm install *)",
       "Bash(node *)",
       "Bash(npm test *)",
-      "Bash(echo \"exit=$?\")"
+      "Bash(echo \"exit=$?\")",
+      "Bash(perl -i -pe \"s/const csv = '\\\\x{FEFF}' \\\\+ lines/const csv = '\\\\\\\\\\\\\\\\uFEFF' + lines/\" src/cli.ts)",
+      "Bash(xxd)",
+      "Bash(npm run *)",
+      "Bash(mkdir -p /tmp/accept)",
+      "Bash(rm -f /tmp/accept/old.db)",
+      "Bash(MONITOR_DB=/tmp/accept/old.db node -e ' *)",
+      "Bash(export MONITOR_DB=/tmp/accept/e2e.db)",
+      "Bash(MONITOR_DB=/tmp/accept/seed.db node dist/src/seed.js)",
+      "Bash(MONITOR_DB=/tmp/accept/seed.db node dist/src/cli.js item list)"
     ]
   }
 }

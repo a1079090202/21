@@ -13,6 +13,12 @@ import { dirname } from 'node:path';
 export const DEFAULT_DB_PATH = process.env.MONITOR_DB ?? './data/monitor.db';
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS groups (
+  name        TEXT PRIMARY KEY,        -- 分组标签，如 finance、web
+  description TEXT,
+  created_at  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS monitor_items (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   kind        TEXT NOT NULL CHECK (kind IN ('domain', 'cert')),
@@ -21,9 +27,11 @@ CREATE TABLE IF NOT EXISTS monitor_items (
   issued_to   TEXT,                -- 证书：签发对象
   expires_on  TEXT NOT NULL,       -- 到期日 'YYYY-MM-DD'（证书为有效期止）
   note        TEXT,
+  group_name  TEXT REFERENCES groups(name),
   created_at  INTEGER NOT NULL,
   UNIQUE (kind, name)
 );
+CREATE INDEX IF NOT EXISTS idx_items_group ON monitor_items(group_name);
 
 CREATE TABLE IF NOT EXISTS check_runs (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,6 +49,7 @@ CREATE TABLE IF NOT EXISTS check_results (
   days_left     INTEGER NOT NULL,
   tier          INTEGER,           -- 命中档位 30/14/7，未命中为 NULL
   silenced      INTEGER NOT NULL DEFAULT 0,
+  silence_kind  TEXT,              -- 静默来源：'item' 单项窗口 / 'group' 组窗口，未静默为 NULL
   alert_created INTEGER NOT NULL DEFAULT 0
 );
 
@@ -68,7 +77,39 @@ CREATE TABLE IF NOT EXISTS silence_windows (
   CHECK (ends_at - starts_at <= 86400000)  -- 静默窗口最长 24 小时
 );
 CREATE INDEX IF NOT EXISTS idx_silence_item ON silence_windows(item_id, starts_at, ends_at);
+
+CREATE TABLE IF NOT EXISTS group_silence_windows (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_name TEXT NOT NULL REFERENCES groups(name),
+  starts_at  INTEGER NOT NULL,     -- epoch 毫秒；窗口按组动态生效，期间新入组的项同样被罩住
+  ends_at    INTEGER NOT NULL,     -- epoch 毫秒
+  reason     TEXT,
+  created_at INTEGER NOT NULL,
+  CHECK (ends_at > starts_at),
+  CHECK (ends_at - starts_at <= 86400000)  -- 静默窗口最长 24 小时
+);
+CREATE INDEX IF NOT EXISTS idx_group_silence ON group_silence_windows(group_name, starts_at, ends_at);
 `;
+
+/**
+ * 旧库轻量迁移：CREATE TABLE IF NOT EXISTS 只对新建库生效，
+ * 已存在的 monitor_items / check_results 用 ALTER TABLE 补列。
+ * 必须在 exec(SCHEMA)（含新索引）之前跑，否则索引会引用不存在的列。
+ */
+function migrate(db: Database.Database): void {
+  const tableExists = (table: string): boolean =>
+    db.prepare('SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?').get('table', table) !== undefined;
+  const columns = (table: string): Set<string> =>
+    new Set(
+      (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name),
+    );
+  const addColumn = (table: string, ddl: string, column: string) => {
+    if (!tableExists(table) || columns(table).has(column)) return;
+    db.exec(`ALTER TABLE ${table} ${ddl}`);
+  };
+  addColumn('monitor_items', 'ADD COLUMN group_name TEXT', 'group_name');
+  addColumn('check_results', 'ADD COLUMN silence_kind TEXT', 'silence_kind');
+}
 
 export type DB = Database.Database;
 
@@ -78,6 +119,7 @@ export function openDb(path: string = DEFAULT_DB_PATH): DB {
   }
   const db = new Database(path);
   db.pragma('foreign_keys = ON');
+  migrate(db);
   db.exec(SCHEMA);
   return db;
 }
